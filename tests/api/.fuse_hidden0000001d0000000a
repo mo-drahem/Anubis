@@ -1,0 +1,265 @@
+import { test, expect } from '../../fixtures/api.fixture';
+import { CleanupStack } from '../../utils/cleanup';
+import { apiConfig } from '../../api/config';
+import { DraftLiveResourceApi } from '../../api/resources/DraftLiveResourceApi';
+import { WORKSPACE_CODE, INVALID_OBJECT_ID } from '../../utils/testEnv';
+import { buildScriptPayload } from '../../utils/testData';
+import { expectOk, expectStatus, expectValidationError, expectErrorBody, expectPersisted } from '../../utils/apiAssertions';
+
+/**
+ * Field shapes confirmed against magpie's Script.java / InputItem.java / OutputItem.java —
+ * plus a live 400 that added three more required fields beyond what the entity class alone
+ * suggested: `type` ("type is missing"), `shortDescription` / `longDescription` ("Script
+ * short/long description is missed"). `type: 'JS'` matches the reference's own
+ * ScriptDataModule.java literal (`.type("JS")`) — Script.java itself just types this as a
+ * bare String, no enum, so there's no fixed list of valid values to enumerate here.
+ * No script-sandboxing or syntax-validation rule was found in the reference — whether an
+ * invalid `scriptText` is rejected at create-time is unconfirmed (see the skipped test below).
+ *
+ * CORRECTED (live run): `scriptText` IS syntax-checked — but only at push-live, not at create
+ * (create with a bare top-level `return input;` succeeded 200; push-live on that same script
+ * 400'd with `{"code": 4009, "message": "SyntaxError: Illegal return statement"}`). A bare
+ * `return` outside a function body is invalid JS when evaluated as a top-level program, which
+ * is apparently how push-live evaluates it. Every `scriptText` below is now wrapped in an IIFE
+ * (`(function() { ... })()`) so `return` is always inside a function scope, regardless of how
+ * it's evaluated.
+ *
+ * SECOND CORRECTION (live run, after the IIFE fix above) — the IIFE/`return` theory was
+ * WRONG, don't reintroduce it: wrapping in `(function() { return { output: ... }; })()` still
+ * 400'd on push-live with the exact same `{"code": 4009, "message": "Error: output type is
+ * missed, or it should be an object"}`, even though the IIFE's return value plainly included
+ * an `output` key holding an object. A live re-run proved the real mechanism is different:
+ * push-live doesn't read a *returned* value at all — it evaluates `scriptText` as a plain
+ * top-level script and then reads a **top-level variable named after each declared output's
+ * `key`** (here, a variable literally called `output`) out of that scope. Anything trapped
+ * inside a function's local scope (including an IIFE's return value) is invisible to it,
+ * which is exactly why "output type is missed" fired even on a well-formed return. This also
+ * explains the real captured sample script referenced in the comment above ("Script output
+ * variables... The output object is required. Please define it wi[th]...") — real scripts
+ * declare `output` as a plain top-level variable, they don't `return` it.
+ *
+ * Combined with the first correction: `scriptText` must (a) contain NO top-level `return`
+ * (illegal outside a function — first correction), and (b) declare a plain top-level variable
+ * named after each declared `output[].key` (here, `output`) holding a value of the declared
+ * type — not wrap anything in a function, since that would hide the variable from whatever
+ * reads it afterward. Every `scriptText` below is a plain statement of the form
+ * `var output = ...;` — no `return`, no wrapping function. That shape (together with the
+ * confirmed `input`/`output` item shapes) is exactly what `buildScriptPayload` in
+ * utils/testData.ts encodes, so these tests can no longer silently drift back to a shape two
+ * live runs already disproved.
+ */
+test.describe('@api Script lifecycle (DRAFT/LIVE)', () => {
+  test('full lifecycle: create draft script -> read -> update -> list -> push live -> activate -> restore live -> delete', async ({
+    scriptApi,
+  }) => {
+    const cleanup = new CleanupStack();
+    const code = `qa_script_${Date.now()}`;
+
+    try {
+      // 1. Create a draft script with one input and one output item.
+      const created = await expectOk(await scriptApi.create(buildScriptPayload(code, WORKSPACE_CODE)));
+      expect(created.code).toBe(code);
+      cleanup.push(() => scriptApi.delete(created.id));
+
+      // 2. Read back.
+      await expectOk(await scriptApi.getById(created.id));
+      await expectOk(await scriptApi.getByCode(code));
+      await expectOk(await scriptApi.getDraftByCode(code));
+
+      // 3. Update scriptText.
+      // Avoids object-spread syntax (`...input`) on top of the `var output = ...` fix above —
+      // unconfirmed whether the server-side JS engine supports it, and there's no upside to
+      // risking a second, unrelated failure mode while re-verifying this fix.
+      const newScriptText = 'var output = Object.assign({}, input, { touched: true });';
+      await expectOk(await scriptApi.update(created.id, { ...created, scriptText: newScriptText }));
+      // A 200 on the PUT only proves the write was ACCEPTED — re-read the draft to prove the
+      // changed field actually persisted. A service that accepts a PUT and silently drops a
+      // field still passes the status assertion above.
+      await expectPersisted(() => scriptApi.getById(created.id), { scriptText: newScriptText });
+
+      // 4. List (global + by workspace).
+      await expectOk(await scriptApi.list());
+      await expectOk(await scriptApi.getByWorkspace(WORKSPACE_CODE));
+
+      // 5. Push live first, THEN activate the resulting LIVE record (using its own id) —
+      // updateState only operates on the LIVE edition; see connection.api.spec.ts's note for
+      // the live-captured evidence (error code 1072, "not found in LIVE DB").
+      const live = await expectOk(await scriptApi.pushLive(code));
+      cleanup.push(() => scriptApi.deleteLive(code));
+
+      await expectOk(await scriptApi.updateState(live.id, 'ACTIVE'));
+      await expectOk(await scriptApi.getLiveByCode(code));
+
+      const restoreRes = await scriptApi.restoreLive(code);
+      expect([200, 400]).toContain(restoreRes.status()); // TODO: tighten once confirmed
+    } finally {
+      await cleanup.runAll();
+    }
+  });
+
+  // --- Negatives (capture-first) ---
+  //
+  // Evidence ported verbatim from magpie's ScriptCrudTests.java (read directly from the
+  // reference source; method names cited per assertion).
+
+  // Dimension 1: missing required fields — the reference tests all 6 required fields, not just
+  // code/scriptText (title kept for continuity with the original scenario catalog).
+  // createDraftScriptNegativeTest (crt_scr.csv).
+  test('rejects a script missing required fields (code / scriptText)', async ({ scriptApi }) => {
+    // Deliberately an EMPTY payload rather than a builder call — the entire point of this test
+    // is that every required field is absent.
+    const res = await scriptApi.create({});
+    await expectValidationError(res, {
+      violations: [
+        { fieldName: 'code', errorMessage: 'Script code is missed' },
+        { fieldName: 'name', errorMessage: 'Script Name is missed' },
+        { fieldName: 'short description', errorMessage: 'Script short description is missed' },
+        { fieldName: 'long description', errorMessage: 'Script long description is missed' },
+        { fieldName: 'type', errorMessage: 'type is missing' },
+        { fieldName: 'script Text', errorMessage: 'Script Text is missed' },
+      ],
+    });
+  });
+
+  // Dimension 3: duplicate code on create — createDraftScriptWithExistingCodeNegativeTest only
+  // asserts status, no body. Matching that exactly.
+  test('rejects a duplicate script code', async ({ scriptApi }) => {
+    const code = `qa_script_dup_${Date.now()}`;
+    const payload = buildScriptPayload(code, WORKSPACE_CODE);
+    const created = await expectOk(await scriptApi.create(payload));
+    try {
+      const dup = await scriptApi.create(payload);
+      await expectStatus(dup, 400);
+    } finally {
+      await scriptApi.delete(created.id);
+    }
+  });
+
+  // Dimension 4: immutable code on update — updateDraftScriptNegativeTest (upd_scr.csv, "without
+  // code" row) omits `code` entirely rather than sending a different value; both violations fire
+  // together in that setup, mirrored here exactly.
+  test('rejects changing a script\'s code on update', async ({ scriptApi }) => {
+    const code = `qa_script_upd_code_${Date.now()}`;
+    const created = await expectOk(await scriptApi.create(buildScriptPayload(code, WORKSPACE_CODE)));
+    try {
+      // `code` is deliberately OMITTED from the update body (rather than set to a different
+      // value) — that is exactly the shape the reference's "without code" row uses, and it's
+      // what makes both captured violations fire together.
+      const { code: _omit, ...withoutCode } = created;
+      const res = await scriptApi.update(created.id, withoutCode);
+      await expectValidationError(res, {
+        violations: [
+          { fieldName: 'code', errorMessage: 'Script code should not be changed.' },
+          { fieldName: 'code', errorMessage: 'Script code is missed' },
+        ],
+      });
+    } finally {
+      await scriptApi.delete(created.id);
+    }
+  });
+
+  // Dimension 5/6: not-found by id / by code — confirmed 400, status-only, no body anywhere in
+  // the reference (no verify404Results usage in ScriptCrudTests.java at all).
+  test('404s on an unknown script id/code', async ({ scriptApi }) => {
+    await expectStatus(await scriptApi.getById(INVALID_OBJECT_ID), 400);
+
+    const invalidCode = `qa_script_does_not_exist_${Date.now()}`;
+    await expectStatus(await scriptApi.getByCode(invalidCode), 400);
+  });
+
+  // Dimension 8: edition guard — NO EVIDENCE IN THE REFERENCE (deleteDraftScriptTest only
+  // deletes a standalone draft with no live edition), but every other draft/live entity in this
+  // project (Mapper, ApiCall, Connection) shares the identical code-2101 guard, so this is a
+  // live capture attempt rather than a guess ported without evidence. PENDING LIVE CAPTURE:
+  // the exact status/code/message below is the same pattern as those other entities, not yet
+  // independently confirmed for Script specifically — tighten or correct after the next run.
+  //
+  // CORRECTED (live run): the first attempt at this test omitted `input`/`output` from the
+  // create payload (unlike the "full lifecycle" test above). That failed push-live with
+  // `{"code": 4009, "message": "ReferenceError: input is not defined"}` — further evidence for
+  // this file's THIRD CORRECTION theory: push-live must inject each declared `input[].key` as a
+  // real pre-bound variable before running `scriptText`, so a script referencing `input` needs
+  // a matching declared `input[]` entry or there's nothing to bind. Fixed by declaring the same
+  // `input`/`output` shape the working "full lifecycle" test uses — both now come from the same
+  // `buildScriptPayload` builder, so they cannot drift apart again. Also restructured with a
+  // proper try/finally around the whole body (not just the delete step) — the first attempt's
+  // draft leaked in dev because `expect(pushLiveRes.status()).toBe(200)` threw before reaching
+  // its own try/finally, skipping cleanup entirely.
+  //
+  // CONFIRMED (live run): status 400 / code 2101 matched the guessed pattern from Mapper/ApiCall
+  // on the first try — but the message text does NOT capitalize the entity name the way Mapper's
+  // does ("Failed to delete Script..."); Script's real message uses lowercase "script". Fixed
+  // below to match exactly what was captured. Don't assume message casing is consistent across
+  // entities just because the code/status/template are.
+  test('blocks deleting a draft script that has a live edition', async ({ scriptApi }) => {
+    const code = `qa_script_del_live_${Date.now()}`;
+    const created = await expectOk(await scriptApi.create(buildScriptPayload(code, WORKSPACE_CODE)));
+    try {
+      await expectOk(await scriptApi.pushLive(code));
+      try {
+        const res = await scriptApi.delete(created.id);
+        await expectErrorBody(res, {
+          status: 400,
+          code: 2101,
+          message: `Failed to delete script with code :${code}, Please delete Live edition first.`,
+        });
+      } finally {
+        await scriptApi.deleteLive(code);
+      }
+    } finally {
+      await scriptApi.delete(created.id);
+    }
+  });
+
+  // Dimension 10: missing/insufficient auth — NO EVIDENCE IN THE REFERENCE (no 401/403/
+  // permission-denied assertion anywhere in ScriptCrudTests.java). Script sits on the
+  // Configuration Service and uses DEFAULT_PERMISSIONS (['WRITE','LIVE']) via the scriptApi
+  // fixture — this test builds its own client with an EMPTY permission set via
+  // `buildInternalClient` (the same tool Secret's equivalent test uses) to see what the server
+  // actually does. PENDING LIVE CAPTURE: status/body below is a starting guess, not evidence —
+  // tighten or correct after the next run.
+  //
+  // SKIPPED (2026-09-02): this test alone was left un-skipped, which does not match this suite's
+  // own convention — every sibling entity's uncaptured auth test (Observer, Global Variables,
+  // Track, ...) is a `test.skip`, and a guessed `>= 400` assertion reported as passing coverage
+  // is worse than an honest skip. The request-building body is kept verbatim below so that
+  // un-skipping it to capture the real status/body is a one-word change; tighten the assertion
+  // to an `expectErrorBody` with whatever that capture shows.
+  test.skip('@pending rejects requests without the required permission/workspace', async ({ buildInternalClient }) => {
+    const noPermApi = new DraftLiveResourceApi(
+      buildInternalClient(apiConfig.configurationServiceUrl(), [], WORKSPACE_CODE),
+      'script'
+    );
+    const code = `qa_script_no_perm_${Date.now()}`;
+    const res = await noPermApi.create(buildScriptPayload(code, WORKSPACE_CODE));
+    expect(res.status()).toBeGreaterThanOrEqual(400);
+  });
+
+  // Open question flagged in the scenario catalog: is an obviously-malformed scriptText
+  // (e.g. unbalanced braces) rejected at create-time, or only at execution time?
+  // CONFIRMED (live capture, 2026-08-25, no longer a skip): create does NOT syntax-check
+  // scriptText at all — a bare top-level `return` (invalid JS outside a function) creates
+  // fine (200). Push-live DOES check it: it 400s with code 4009,
+  // "SyntaxError: Illegal return statement". This is the same bug this file's own "full
+  // lifecycle" test tripped over before its scriptText values were wrapped in an IIFE — see
+  // the file-level comment above.
+  test('rejects push-live of a script with invalid scriptText syntax', async ({ scriptApi }) => {
+    const code = `qa_script_badsyntax_${Date.now()}`;
+    // Builder defaults, with `scriptText` deliberately CORRUPTED via an override to a bare
+    // top-level `return` outside any function. Create doesn't syntax-check this (see above) —
+    // the rejection only happens at push-live, which is what this test asserts.
+    const created = await expectOk(
+      await scriptApi.create(buildScriptPayload(code, WORKSPACE_CODE, { scriptText: 'return input;' }))
+    );
+    try {
+      const res = await scriptApi.pushLive(code);
+      await expectErrorBody(res, {
+        status: 400,
+        code: 4009,
+        message: 'SyntaxError: Illegal return statement',
+      });
+    } finally {
+      await scriptApi.delete(created.id);
+    }
+  });
+});

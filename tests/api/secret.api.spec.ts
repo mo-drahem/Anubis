@@ -1,0 +1,157 @@
+import { test, expect } from '../../fixtures/api.fixture';
+import { apiConfig } from '../../api/config';
+import { SecretApi } from '../../api/resources/SecretApi';
+import { buildSecretPayload } from '../../utils/testData';
+import { INVALID_OBJECT_ID, WORKSPACE_CODE } from '../../utils/testEnv';
+import { expectErrorBody, expectOk, expectRejected, expectValidationError } from '../../utils/apiAssertions';
+
+// WORKSPACE_CODE is imported from utils/testEnv.ts rather than re-declared here — see that
+// module's note (and connection.api.spec.ts's) for the real bug the per-file duplicate caused.
+// `apiConfig` is still imported for `configurationServiceUrl()` in the VAULT-permission test.
+
+/**
+ * Secret is plain CRUD — no draft/live/state/workspace-change (confirmed against the
+ * reference; see SecretApi.ts). `secretValue` is confirmed to be stripped from LIST
+ * responses; whether get-by-id/get-by-code/get-private also mask it is NOT confirmed —
+ * the assertions below are deliberately loose on that point until captured.
+ */
+test.describe('Secret CRUD', { tag: '@api' }, () => {
+  test('API-SECR-001 — full lifecycle: create -> read -> list (masked?) -> update -> delete', async ({ secretApi }) => {
+    const code = `qa_secret_${Date.now()}`;
+    let id: string | undefined;
+
+    try {
+      // 1. Create. `buildSecretPayload`'s defaults are exactly what this test used inline
+      // (secretValue 'qa-initial-value').
+      const created = await expectOk(await secretApi.create(buildSecretPayload(code, WORKSPACE_CODE)));
+      expect(created.code).toBe(code);
+      id = created.id;
+
+      // 2. Read back by id and by code.
+      await expectOk(await secretApi.getById(id!));
+      await expectOk(await secretApi.getByCode(code));
+
+      // 3. List by workspace — confirm whether secretValue is masked here (reference
+      // strips it from list responses; not confirmed for this specific endpoint).
+      await expectOk(await secretApi.getByWorkspace(WORKSPACE_CODE));
+      // TODO once captured: assert secretValue is either absent or masked in the list body.
+
+      // 4. Update the value.
+      await expectOk(
+        await secretApi.update(id!, {
+          ...created,
+          secretValue: 'qa-updated-value',
+        })
+      );
+
+      // 4b. Re-read after the update (added in the 2026-09-02 architecture pass — this test
+      // previously asserted only that the PUT returned 200 and never looked at the record
+      // again). Deliberately a PLAIN re-read rather than an `expectPersisted({ secretValue:
+      // 'qa-updated-value' })`: whether get-by-id returns the raw `secretValue` or a masked/
+      // stripped one is explicitly NOT confirmed for this endpoint (see this file's header note
+      // and SecretApi.ts's) — `secretValue` is confirmed stripped from LIST responses, so
+      // asserting it comes back verbatim here would be a guess, and asserting it's masked would
+      // be an equally uncaptured guess in the other direction. This at least proves the record
+      // still resolves after the update.
+      // TODO once captured: promote to `expectPersisted(() => secretApi.getById(id!), { ... })`
+      // with whichever of the two shapes a real response actually shows.
+      await expectOk(await secretApi.getById(id!));
+    } finally {
+      if (id) await secretApi.delete(id);
+    }
+  });
+
+  test('API-SECR-002 — check(workspaceCode, secretCode) and getPrivateByCode(code) respond', async ({ secretApi }) => {
+    const code = `qa_secret_check_${Date.now()}`;
+    const created = await expectOk(
+      await secretApi.create(buildSecretPayload(code, WORKSPACE_CODE, { secretValue: 'qa-value' }))
+    );
+
+    try {
+      // Response shape unconfirmed for both — asserting on status only for now.
+      const checkRes = await secretApi.check(WORKSPACE_CODE, code);
+      expect([200, 204, 404]).toContain(checkRes.status()); // TODO: tighten once confirmed
+
+      const privateRes = await secretApi.getPrivateByCode(code);
+      expect([200, 403, 404]).toContain(privateRes.status()); // TODO: tighten once confirmed — may require VAULT permission
+    } finally {
+      await secretApi.delete(created.id);
+    }
+  });
+
+  // --- Negatives (capture-first) ---
+  //
+  // Evidence ported verbatim from magpie's SecretCrudTests.java (read directly from the
+  // reference source; method names cited per assertion).
+
+  // Dimension 1: missing required fields.
+  // createSecretNegativeTest (crt_sec.csv), row "without required fields" (payload `{}`).
+  test('API-SECR-003 — rejects a secret missing required fields (code / secretValue)', async ({ secretApi }) => {
+    // The empty payload is the point of this test — deliberately NOT built via
+    // buildSecretPayload, which cannot express "no fields at all".
+    const res = await secretApi.create({});
+    const body = await expectValidationError(res, {
+      violations: [
+        { fieldName: 'code', errorMessage: 'Code is missing' },
+        { fieldName: 'name', errorMessage: 'Name is missing' },
+        { fieldName: 'secretValue', errorMessage: 'Secret value is missing' },
+      ],
+    });
+    expect(body.status).toBe('BAD_REQUEST');
+  });
+
+  // Dimension 3: duplicate code on create — the reference itself (createSecretWithExistingCodeNegativeTest)
+  // only asserts status ∈ {400, 404} and never checks a response body, so there is still no
+  // captured body to assert here.
+  //
+  // CONVERTED (2026-09-02 architecture pass) from a bare `expect([400, 404]).toContain(...)` to
+  // `expectRejected`: same "this must be rejected" meaning, but it also ATTACHES the real
+  // response body to the test report, so the next live run captures the code/message this
+  // assertion is missing instead of discarding it again. (It asserts 4xx rather than exactly
+  // {400, 404} — a 5xx for a duplicate key would be a real finding, which the helper reports as
+  // such.) Tighten to `expectErrorBody` once that capture exists.
+  test('API-SECR-004 — rejects a duplicate secret code', async ({ secretApi }) => {
+    const code = `qa_secret_dup_${Date.now()}`;
+    const payload = buildSecretPayload(code, WORKSPACE_CODE, { secretValue: 'qa-value' });
+    const created = await expectOk(await secretApi.create(payload));
+    try {
+      const dup = await secretApi.create(payload);
+      await expectRejected(dup, 'creating a second secret with an already-used code');
+    } finally {
+      await secretApi.delete(created.id);
+    }
+  });
+
+  // Dimension 5/6: not-found by id / by code — every not-found path in the reference
+  // (fetchSecretByInvalidIdNegativeTest, fetchSecretByInvalidCodeNegativeTest, and their
+  // "malformed id" siblings) asserts status ∈ {400, 404} with no body check, never a single
+  // pinned-down value — so there is still no captured body to assert here.
+  //
+  // CONVERTED (2026-09-02 architecture pass) to `expectRejected` for the same reason as the
+  // duplicate-code test above: identical meaning, plus the real body lands in the report so the
+  // next run captures Secret's actual not-found code/message.
+  test('API-SECR-005 — 404s on an unknown secret id/code', async ({ secretApi }) => {
+    const byId = await secretApi.getById(INVALID_OBJECT_ID);
+    await expectRejected(byId, 'fetching a secret by an id that does not exist');
+
+    const invalidCode = `qa_secret_does_not_exist_${Date.now()}`;
+    const byCode = await secretApi.getByCode(invalidCode);
+    await expectRejected(byCode, 'fetching a secret by a code that does not exist');
+  });
+
+  // Dimension 10: missing/insufficient permission. NOT covered by magpie itself (every test in
+  // SecretCrudTests.java/SecretListingTests.java exclusively uses internalVaultHeaders() — no
+  // reference test ever swaps in a different permission and checks for a denial). This IS,
+  // however, real evidence from this project's OWN earlier live capture against dev (see
+  // fixtures/api.fixture.ts's secretApi comment): calling Secret with WRITE instead of VAULT
+  // returned an actual 400 "Access Denied" (code 1111, status UNAUTHORIZED).
+  test('API-SECR-006 — rejects requests without the VAULT permission', async ({ buildInternalClient }) => {
+    const wrongPermissionClient = new SecretApi(buildInternalClient(apiConfig.configurationServiceUrl(), ['WRITE'], WORKSPACE_CODE));
+    const code = `qa_secret_no_vault_${Date.now()}`;
+    const res = await wrongPermissionClient.create(
+      buildSecretPayload(code, WORKSPACE_CODE, { secretValue: 'qa-value' })
+    );
+    const body = await expectErrorBody(res, { status: 400, code: 1111, message: 'Access Denied' });
+    expect(body.status).toBe('UNAUTHORIZED');
+  });
+});

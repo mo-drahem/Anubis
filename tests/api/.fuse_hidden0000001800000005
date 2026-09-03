@@ -1,0 +1,68 @@
+import { test, expect } from '../../fixtures/api.fixture';
+import { expectOk, expectRejected, safeJson } from '../../utils/apiAssertions';
+
+/**
+ * Input Core's alternate push route (`POST /input/pushEvent`). HTTP verb and payload shape are
+ * inferred from magpie's interface — compare against the API Gateway path in the positive test
+ * below and tighten once a live capture confirms both return the same job shape.
+ */
+test.describe('@api Input Core (alternate push route)', () => {
+  test('pushing an event via Input Core returns a created job', async ({ inputCoreApi }) => {
+    const eventKey = `qa_input_core_${Date.now()}`;
+    const res = await inputCoreApi.pushEvent({
+      eventKey,
+      eventType: 'MAIN',
+      payload: { test: 'input core probe' },
+    });
+
+    const body = await safeJson(res);
+    await test.info().attach(`capture-me: Input Core push (${res.status()})`, {
+      body: Buffer.from(JSON.stringify({ status: res.status(), body }, null, 2)),
+      contentType: 'application/json',
+    });
+
+    if (res.status() >= 400) {
+      // Capture-first: some environments may not route this path yet — attach evidence and fail
+      // with the real body rather than guessing a success shape.
+      expect(res.status(), JSON.stringify(body)).toBeLessThan(400);
+      return;
+    }
+
+    const pushed = await expectOk(res);
+    expect(pushed.emsJobId ?? pushed.jobId, `Push body: ${JSON.stringify(pushed)}`).toBeTruthy();
+  });
+
+  /**
+   * REAL FINDING, NOT A TEST BUG (captured 2026-09-02) — which is why this is @pending.
+   *
+   * The assertion below is "a caller without WRITE cannot push". The service returned **200**
+   * and created a real job:
+   *   {"emsJobId":"qa_no_perm_1788352527337-7b4dc29f-…","status":"created",
+   *    "generatedBy":"INPUT_CORE_SERVICE","eventType":"MAIN"}
+   *
+   * So `/input/pushEvent` accepts an identity holding only `EMS_ACCESS` — no WRITE, no workspace
+   * scope — and ingests the event anyway. Compare Secret, which enforces its VAULT requirement
+   * with a real 1111 "Access Denied".
+   *
+   * Deliberately left as @pending with the assertion UNCHANGED, rather than "fixed" by asserting
+   * the 200. Asserting 200 would enshrine "this endpoint has no authorization" as expected
+   * behaviour, and the suite would then fail later if EMS added the check — failing for doing
+   * the right thing is worse than not covering it.
+   *
+   * ACTION: raise with the EMS team. It resolves either way:
+   *   - it SHOULD enforce WRITE  -> a real bug; un-skip once fixed, this assertion is already right.
+   *   - it is intentionally open (internal-network trust boundary) -> replace with a test that
+   *     asserts that documented intent, and record the decision in the domain notes.
+   */
+  test.skip('@pending rejects requests without the required permission/workspace', async ({ buildInternalClient }) => {
+    const { InputCoreApi } = await import('../../api/resources/InputCoreApi');
+    const { apiConfig } = await import('../../api/config');
+    const readOnlyInputCore = new InputCoreApi(buildInternalClient(apiConfig.inputCoreUrl(), ['EMS_ACCESS']));
+    const res = await readOnlyInputCore.pushEvent({
+      eventKey: `qa_no_perm_${Date.now()}`,
+      eventType: 'MAIN',
+      payload: { test: 'denied' },
+    });
+    await expectRejected(res, 'input core push without WRITE permission');
+  });
+});

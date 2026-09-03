@@ -1,0 +1,40 @@
+# ---- dependencies ----------------------------------------------------------------------
+node_modules/
+
+# ---- run artifacts ---------------------------------------------------------------------
+# Never commit these. Beyond being regenerated on every run, allure-results/ and
+# test-results/ contain the request and response bodies captured from real runs against
+# ems-dev — including the internal identity headers BaseApiClient attaches. That is live
+# auth material sitting in a JSON file, and it must not enter git history.
+test-results/
+allure-results/
+allure-report/
+playwright-report/
+blob-report/
+playwright/.cache/
+dist/
+*.log
+
+# ---- per-environment secrets — never commit real credentials ---------------------------
+# .env.example is the committed template; the real files carry TEST_USER_PASSWORD and the
+# internal service URLs and stay local. Matched at any depth, so a stray copy in a
+# subfolder is covered too.
+.env.dev
+.env.staging
+.env.prod
+.env.local
+.env.*.local
+
+# Scratch copies of the same environment values (internal service URLs). Superseded by
+# .env.* — kept locally, not versioned.
+env-*-reconciled.txt
+
+# ---- editors ---------------------------------------------------------------------------
+.idea/
+.vscode/
+.DS_Store
+
+# ---- superseded work -------------------------------------------------------------------
+# Old specs replaced during the framework rebuild, plus two .zip archives and a stray
+# _update_tmp/.env.prod. Kept on disk for reference; not part of the framework.
+_to_delete/

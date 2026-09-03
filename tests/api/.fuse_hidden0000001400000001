@@ -1,0 +1,310 @@
+import { test, expect } from '../../fixtures/api.fixture';
+import { CleanupStack } from '../../utils/cleanup';
+import { apiConfig } from '../../api/config';
+import { createActiveApiConnection } from '../../utils/apiDeps';
+import { buildApiCallDetails, buildApiCallPayload } from '../../utils/testData';
+import { INVALID_OBJECT_ID, WORKSPACE_CODE } from '../../utils/testEnv';
+import {
+  expectErrorBody,
+  expectOk,
+  expectPersisted,
+  expectRejected,
+  expectStatus,
+  expectValidationError,
+} from '../../utils/apiAssertions';
+
+// WORKSPACE_CODE is imported from utils/testEnv.ts rather than re-declared here — see that
+// module's note (and connection.api.spec.ts's) for the real bug the per-file duplicate caused.
+// `apiConfig` is still imported: the hand-built negative payloads below send `createdBy`/
+// `modifiedBy` from `apiConfig.identityEmail`.
+
+/**
+ * Field shapes confirmed against magpie's ApiCall.java / Details.java / Handler.java / Path.java.
+ * An Api Call always references a Connection via `connectionCode` — these tests create a
+ * fresh Connection dependency first rather than depending on a pre-existing one, so this file
+ * is self-contained.
+ *
+ * CORRECTED (2026-08-25, flagged by the user's own domain knowledge): every Api Call create
+ * call in this file previously referenced a merely-DRAFT Connection. The real rule is that the
+ * Connection must be LIVE and ACTIVE to be usable — see `utils/apiDeps.ts`'s
+ * `createActiveApiConnection` helper (mirrors `observer.api.spec.ts`'s `createObserverDeps`,
+ * which already applied the same rule for Observer's Connection dependency). This is also the
+ * leading candidate for what was previously logged as a "confirmed backend bug" — every
+ * `POST /api-call` create 500'ing unconditionally with `{"code": 1009, "message": null}" — see
+ * that helper's doc comment. Every Connection dependency below is now pushed live + activated
+ * before being referenced; re-verify against a live run before treating either the "backend
+ * bug" retraction or this fix as settled.
+ *
+ * CORRECTED (2026-08-25, real captured curl from the user's own browser session): every create
+ * payload below now goes through `buildApiCallPayload`/`buildApiCallDetails`
+ * (`utils/testData.ts`), which includes `createdBy`/`modifiedBy`, an explicit `state:
+ * 'INACTIVE'`, `details.path` without a leading slash, and `details.requestBody: ''` — all
+ * present in the real curl but previously missing or wrong in every create call in this file.
+ * See that builder's doc comment for the full diff.
+ */
+test.describe('@api Api Call lifecycle (DRAFT/LIVE)', () => {
+  test('full lifecycle: create connection dependency -> create draft api call -> read -> update -> list -> push live -> activate -> delete', async ({
+    connectionApi,
+    apiCallApi,
+  }) => {
+    const cleanup = new CleanupStack();
+    const code = `qa_apc_${Date.now()}`;
+
+    try {
+      // 0. Dependency: a LIVE + ACTIVE API-type Connection.
+      const cxnCode = await createActiveApiConnection(connectionApi, cleanup, WORKSPACE_CODE, 'qa_cxn_for_apc');
+
+      // 1. Create a draft Api Call against that connection.
+      const created = await expectOk(await apiCallApi.create(buildApiCallPayload(code, WORKSPACE_CODE, cxnCode)));
+      expect(created.code).toBe(code);
+      expect(created.connectionCode).toBe(cxnCode);
+      cleanup.push(() => apiCallApi.delete(created.id));
+
+      // 2. Read back.
+      await expectOk(await apiCallApi.getById(created.id));
+      await expectOk(await apiCallApi.getByCode(code));
+      await expectOk(await apiCallApi.getDraftByCode(code));
+
+      // 3. Update details.
+      const updatedHttpMethod = 'POST';
+      await expectOk(
+        await apiCallApi.update(created.id, {
+          ...created,
+          details: { ...created.details, httpMethod: updatedHttpMethod },
+        })
+      );
+
+      // 3b. Verify the update actually PERSISTED, not just that the PUT returned 200 (added in
+      // the 2026-09-02 architecture pass — this test previously never re-read the record).
+      // Only `details.httpMethod` is asserted: it's the single field this step just wrote.
+      // objectContaining rather than a whole-`details` compare, since the rest of `details` is
+      // echoed straight back and isn't what's being verified here.
+      await expectPersisted(() => apiCallApi.getById(created.id), {
+        details: expect.objectContaining({ httpMethod: updatedHttpMethod }),
+      });
+
+      // 4. List (global + by workspace).
+      await expectOk(await apiCallApi.list());
+      await expectOk(await apiCallApi.getByWorkspace(WORKSPACE_CODE));
+
+      // 5. Push live first, THEN activate the resulting LIVE record (using ITS id, not the
+      // draft's) — confirmed live: updateState on a draft id 404s "not found in LIVE DB",
+      // matching magpie's own updateDraftConnectionStateNegativeTest / updateLiveApiCallStateTest
+      // pattern (see connection.api.spec.ts's fuller note).
+      const live = await expectOk(await apiCallApi.pushLive(code));
+      cleanup.push(() => apiCallApi.deleteLive(code));
+
+      await expectOk(await apiCallApi.updateState(live.id, 'ACTIVE'));
+      await expectOk(await apiCallApi.getLiveByCode(code));
+    } finally {
+      await cleanup.runAll();
+    }
+  });
+
+  // --- Negatives (capture-first) ---
+  //
+  // Evidence ported verbatim from magpie's ApiCallCrudTests.java (read directly from the
+  // reference source; method names cited per assertion). All 400s go through
+  // `BaseEmsSteps.verify400Results`, which genuinely asserts HTTP 400 (not just the body).
+
+  const apcDetails = buildApiCallDetails();
+
+  // Dimension 1: missing required field(s) (code / connectionCode).
+  // createDraftApiCallNegativeTest (crt_apc.csv), rows "without code" / "without connection code".
+  test('rejects an api call missing required fields', async ({ connectionApi, apiCallApi }) => {
+    const cleanup = new CleanupStack();
+    try {
+      const cxnCode = await createActiveApiConnection(connectionApi, cleanup, WORKSPACE_CODE, 'qa_cxn_for_apc_neg');
+      // Both payloads below are hand-built rather than routed through buildApiCallPayload: each
+      // one deliberately OMITS a required field (`code`, then `connectionCode`) that the builder
+      // always supplies, and that omission is the whole point of the test.
+      const noCodeRes = await apiCallApi.create({
+        name: 'x',
+        createdBy: apiConfig.identityEmail,
+        modifiedBy: apiConfig.identityEmail,
+        state: 'INACTIVE',
+        workspaceCode: WORKSPACE_CODE,
+        connectionCode: cxnCode,
+        details: apcDetails,
+      });
+      await expectValidationError(noCodeRes, {
+        violations: [{ fieldName: 'code', errorMessage: 'ApiCall code is missed' }],
+      });
+
+      const code = `qa_apc_missing_cxn_${Date.now()}`;
+      const noCxnRes = await apiCallApi.create({
+        code,
+        name: code,
+        createdBy: apiConfig.identityEmail,
+        modifiedBy: apiConfig.identityEmail,
+        state: 'INACTIVE',
+        workspaceCode: WORKSPACE_CODE,
+        details: apcDetails,
+      });
+      // NOTE: the captured evidence for this row is the 1005 code + the `connectionCode`
+      // violation; the reference never pinned `message` for it, so it stays at the helper's
+      // 'Validation Error' default (the same value the sibling assertion above captured).
+      await expectValidationError(noCxnRes, {
+        violations: [{ fieldName: 'connectionCode', errorMessage: 'Connection code is missing' }],
+      });
+    } finally {
+      await cleanup.runAll();
+    }
+  });
+
+  // connectionCode pointing at a non-existent Connection — NO EVIDENCE FOUND. ApiCallCrudTests.java
+  // only tests a MISSING connectionCode (above), never an unknown/nonexistent one — grep for
+  // "connection" in the file turns up nothing else. Left skipped rather than guessing the
+  // earlier-assumed code 1003 for this specific case.
+  test.skip('@pending rejects an api call whose connectionCode does not exist', async () => {});
+
+  // Dimension 2: invalid details.httpMethod enum value (`OTHER`) — Jackson enum-parse shape
+  // (code 1010, no violations). Distinct from a VALID-but-unsupported method for a given
+  // connection, which is a separate 1005 bean-validation case not covered by this stub.
+  // createDraftApiCallNegativeTest, CSV row "with invalid http method".
+  test('rejects an api call with an invalid http method', async ({ connectionApi, apiCallApi }) => {
+    const cleanup = new CleanupStack();
+    try {
+      const cxnCode = await createActiveApiConnection(connectionApi, cleanup, WORKSPACE_CODE, 'qa_cxn_for_apc_method');
+      const code = `qa_apc_bad_method_${Date.now()}`;
+      const res = await apiCallApi.create(
+        buildApiCallPayload(code, WORKSPACE_CODE, cxnCode, { details: buildApiCallDetails({ httpMethod: 'OTHER' }) })
+      );
+      const body = await expectErrorBody(res, {
+        status: 400,
+        code: 1010,
+        message:
+          'JSON parse error: Cannot deserialize value of type `com.seera.core.ems.common.constant.HttpMethodE` from String "OTHER": not one of the values accepted for Enum class: [POST, DELETE, GET, PUT, PATCH]',
+      });
+      expect(body.violations).toBeFalsy();
+    } finally {
+      await cleanup.runAll();
+    }
+  });
+
+  // Dimension 3: duplicate code on create.
+  // createDraftApiCallWithExistingCodeNegativeTest.
+  test('rejects a duplicate api call code', async ({ connectionApi, apiCallApi }) => {
+    const cleanup = new CleanupStack();
+    try {
+      const cxnCode = await createActiveApiConnection(connectionApi, cleanup, WORKSPACE_CODE, 'qa_cxn_for_apc_dup');
+      const code = `qa_apc_dup_${Date.now()}`;
+      const payload = buildApiCallPayload(code, WORKSPACE_CODE, cxnCode);
+      const created = await expectOk(await apiCallApi.create(payload));
+      cleanup.push(() => apiCallApi.delete(created.id));
+
+      const dup = await apiCallApi.create(payload);
+      await expectValidationError(dup, {
+        violations: [{ fieldName: 'code', errorMessage: 'Duplicate key exist!' }],
+      });
+    } finally {
+      await cleanup.runAll();
+    }
+  });
+
+  // Dimension 4: immutable code on update.
+  //
+  // CORRECTED (2026-08-26, live capture): this was assumed to be a bean-validation-style 1005
+  // rejection with a `violations` array reading "ApiCall code should not be changed." (ported
+  // from ApiCallCrudTests.java's updateDraftApiCallWithExistingCodeNegativeTest without having
+  // captured it live yet). The real server behavior is different and simpler: update apparently
+  // looks the DRAFT record up BY THE `code` FIELD IN THE REQUEST BODY (not by the `id` in the
+  // URL) before applying the update. Since the body here carries the *new*, changed code — which
+  // doesn't exist yet in the DRAFT collection — that lookup itself fails, and the response is
+  // the same "not found" shape (code 1003) already confirmed for the by-id/by-code lookup tests,
+  // not a validation violation:
+  //   {"code": 1003, "status": "BAD_REQUEST",
+  //    "message": "Failed to get apiCall with empty code, or no apiCall with code : [<the new
+  //    code sent in the body>] in [ DRAFT ] DB"}
+  // No `violations` array is present at all. This also means the code-change is never actually
+  // rejected AS a change — it just never resolves the record to update in the first place.
+  test('rejects changing an api call\'s code on update', async ({ connectionApi, apiCallApi }) => {
+    const cleanup = new CleanupStack();
+    try {
+      const cxnCode = await createActiveApiConnection(connectionApi, cleanup, WORKSPACE_CODE, 'qa_cxn_for_apc_updcode');
+      const code = `qa_apc_updcode_${Date.now()}`;
+      const created = await expectOk(await apiCallApi.create(buildApiCallPayload(code, WORKSPACE_CODE, cxnCode)));
+      cleanup.push(() => apiCallApi.delete(created.id));
+
+      const changedCode = `${code}_changed`;
+      const res = await apiCallApi.update(created.id, { ...created, code: changedCode });
+      await expectErrorBody(res, {
+        status: 400,
+        code: 1003,
+        message: `Failed to get apiCall with empty code, or no apiCall with code : [${changedCode}] in [ DRAFT ] DB`,
+      });
+    } finally {
+      await cleanup.runAll();
+    }
+  });
+
+  // Dimension 5/6: not-found by id / by code — confirmed as 400 with entity code 1003, NEVER a
+  // real HTTP 404 (no `verify404Results`/SC_NOT_FOUND appears anywhere in ApiCallCrudTests.java).
+  // fetchDraftApiCallWithInvalidId (by id) / deleteLiveApiCallByInvalidCodeNegativeTest (by code,
+  // note the differing whitespace in the two literal messages — preserved exactly).
+  test('404s on an unknown api call id/code', async ({ apiCallApi }) => {
+    const byId = await apiCallApi.getById(INVALID_OBJECT_ID);
+    await expectErrorBody(byId, {
+      status: 400,
+      code: 1003,
+      message: `Failed to get apiCall with empty id, or no apiCall with id :${INVALID_OBJECT_ID}`,
+    });
+
+    // By-code stays status-only: the reference (deleteLiveApiCallByInvalidCodeNegativeTest) has
+    // its own differently-whitespaced message for this path and no body was captured here.
+    const invalidCode = `qa_apc_does_not_exist_${Date.now()}`;
+    await expectStatus(await apiCallApi.getDraftByCode(invalidCode), 400);
+  });
+
+  // Dimension 8: edition guard — deleting a draft that still has a live twin.
+  //
+  // ADDED as a skip in the 2026-09-02 architecture pass: this file had no test at all for this
+  // dimension, not even a stub, while every sibling entity does. The MECHANISM is confirmed
+  // (Mapper captures it live as code 2101 "Failed to delete Mapper with code :<code>, Please
+  // delete Live edition first."; Connection and Flow have their own captured versions, and the
+  // "Bonus scenarios" note at the bottom of this file records that
+  // ApiCallCrudTests.java exercises it for Api Call too). What has NOT been captured is Api
+  // Call's OWN response code and message for it — and this project has been bitten before by
+  // assuming one entity's wording carries over to another (Script's delete-guard message casing,
+  // Mapper's 1004-not-1005 duplicate-key code). So no expected body is written here: deliberately
+  // NOT copying Mapper's captured message across.
+  //
+  // INTENDED NEXT STEP: unskip after one live run. The body below already performs the real
+  // create -> push-live -> delete-draft sequence and hands the response to `expectRejected`,
+  // which asserts only "this was rejected with a 4xx" and ATTACHES the real body to the report —
+  // so the very first live run captures the exact code/message needed to tighten this into an
+  // `expectErrorBody({ status, code, message })` call like Mapper's.
+  test('blocks deleting a draft api call that has a live edition', async ({ connectionApi, apiCallApi }) => {
+    const cleanup = new CleanupStack();
+    try {
+      const cxnCode = await createActiveApiConnection(connectionApi, cleanup, WORKSPACE_CODE, 'qa_cxn_for_apc_del_live');
+      const code = `qa_apc_del_live_${Date.now()}`;
+      const created = await expectOk(await apiCallApi.create(buildApiCallPayload(code, WORKSPACE_CODE, cxnCode)));
+      cleanup.push(() => apiCallApi.delete(created.id));
+      await expectOk(await apiCallApi.pushLive(code));
+      cleanup.push(() => apiCallApi.deleteLive(code));
+
+      const res = await apiCallApi.delete(created.id);
+      await expectRejected(res, 'deleting a DRAFT api call while a LIVE edition still exists');
+    } finally {
+      await cleanup.runAll();
+    }
+  });
+
+  // Dimension 10: missing/insufficient auth — NO EVIDENCE FOUND. No 401/403/permission
+  // assertion exists anywhere in ApiCallCrudTests.java (grep confirmed zero hits).
+  test.skip('@pending rejects requests without the required permission/workspace', async () => {});
+
+  // Gap noted in the scenario catalog: `listByCodes`, `listByConnectionCode` are confirmed
+  // to exist in the reference but aren't wired into DraftLiveResourceApi yet — add a
+  // one-off method here (or a small ApiCallApi subclass) before writing tests against them.
+  // (Confirmed zero occurrences of either method name in ApiCallCrudTests.java itself — they'd
+  // need to be sourced from ApiCallListingTests.java in a future pass.)
+
+  // Bonus scenarios confirmed in the reference but not part of this project's original catalog:
+  // - updateLiveApiCallNegativeTest: editing a LIVE edition directly -> 1005, violation
+  //   {"edition","Failed to update live edition, please update draft one."}.
+  // - updateLiveApiCallStateWithInvalidStateNegativeTest: invalid state value -> 1008 typeMismatch.
+  // - deleteDraftApiCallWithExistingLiveVersionNegativeTest: 2101 "Failed to delete apiCall with
+  //   code :%s, Please delete Live edition first." (same edition-guard pattern as Connection).
+});

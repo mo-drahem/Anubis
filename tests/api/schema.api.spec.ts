@@ -1,0 +1,276 @@
+import { test, expect } from '../../fixtures/api.fixture';
+import { CleanupStack } from '../../utils/cleanup';
+import { buildEventSchemaPayload } from '../../utils/testData';
+import { INVALID_OBJECT_ID, WORKSPACE_CODE } from '../../utils/testEnv';
+import {
+  expectErrorBody,
+  expectOk,
+  expectPersisted,
+  expectValidationError,
+  safeJson,
+} from '../../utils/apiAssertions';
+
+/**
+ * Field shapes confirmed against magpie's Schema.java / SchemaField.java / SchemaFieldType.java.
+ * `version` is confirmed to be a real field (supporting the "version bump on push-live" rule
+ * from EMS_API_Domain_Notes.md), but the bump mechanics themselves are NOT confirmed from
+ * source — step 6 below captures before/after and leaves the assertion as a TODO.
+ *
+ * The reference test suite does not exercise `restoreLive`/`changeWorkspace` for Schema
+ * specifically (unlike Connection/ApiCall/Script/GlobalVariables) — treat those two calls
+ * below as exploratory, not settled behavior, until a real response is captured.
+ */
+test.describe('Schema lifecycle (DRAFT/LIVE)', { tag: '@api' }, () => {
+  test('API-SCHM-001 — full lifecycle: create draft EVENT schema -> read -> update -> list -> push live -> activate (version check) -> delete', async ({
+    schemaApi,
+  }) => {
+    const cleanup = new CleanupStack();
+    const code = `qa_schema_${Date.now()}`;
+
+    try {
+      // 1. Create a draft EVENT-type schema (the type that matters for the push->Flow path).
+      const createRes = await schemaApi.create(
+        buildEventSchemaPayload(code, WORKSPACE_CODE, [
+          { name: 'orderId', type: 'STRING', required: true, description: 'Order identifier' },
+          { name: 'amount', type: 'DOUBLE', required: false, description: 'Order amount' },
+        ])
+      );
+      const created = await expectOk(createRes);
+      expect(created.code).toBe(code);
+      const versionBeforePushLive = created.version;
+      cleanup.push(() => schemaApi.delete(created.id));
+
+      // 2. Read back.
+      await expectOk(await schemaApi.getById(created.id));
+      await expectOk(await schemaApi.getByCode(code));
+      // TIGHTENED (2026-09-02 architecture pass): this line used to assert
+      // `.toBeGreaterThanOrEqual(200)`, which is a no-op range check — every HTTP status this
+      // client can return satisfies it, so the call was effectively unasserted. It is a positive
+      // read inside a lifecycle test whose every other read is a confirmed 200, so it now
+      // asserts a real 200.
+      // CORRECTED (2026-09-02, real captured failure): this passed 'DRAFT' as the STATE and got
+      //   {"code":1008,"status":"typeMismatch","message":"Method parameter 'state': Failed to
+      //    convert value of type 'java.lang.String' to required type
+      //    '...constants.SchemaInfoStateE' ... for value [DRAFT]"}
+      // DRAFT/LIVE is the EDITION (a header), never the state path param — exactly as
+      // DraftLiveResourceApi.getByCodeAndState's own doc says. `SchemaInfoStateE` holds the
+      // business state, and a freshly created record is INACTIVE until step 5 activates it.
+      //
+      // Worth noting HOW this surfaced: the line used to assert `toBeGreaterThanOrEqual(200)`,
+      // a no-op range check that a 400 satisfies. Tightening it to a real 200 in the
+      // architecture pass is what exposed a bug that had been sitting here silently.
+      await expectOk(await schemaApi.getByCodeAndState(code, 'INACTIVE'));
+
+      // 3. Update (add a field). Also changes `shortDescription` so there is a scalar field
+      // whose persistence can actually be verified below — see the expectPersisted note.
+      const updatedShortDescription = 'Updated by ems-ui-automation';
+      const updateRes = await schemaApi.update(created.id, {
+        ...created,
+        shortDescription: updatedShortDescription,
+        fields: [...created.fields, { name: 'currency', type: 'STRING', required: true, description: 'ISO currency code' }],
+      });
+      await expectOk(updateRes);
+
+      // 3b. Update-PERSISTENCE check (added 2026-09-02): a 200 from the PUT above only proves
+      // the write was accepted, not that anything changed — a service that silently drops a
+      // field passes that assertion. Re-reads the record and asserts the new value came back.
+      // Deliberately asserts `shortDescription` (a scalar we control) and NOT the `fields`
+      // array: the exact shape the server echoes back for `fields` has never been captured, so
+      // a deep-equality assertion on it would be a guess. Extend this to `fields` once a real
+      // captured read confirms the echoed shape.
+      await expectPersisted(() => schemaApi.getById(created.id), { shortDescription: updatedShortDescription });
+
+      // 4. List (global + by workspace).
+      await expectOk(await schemaApi.list());
+      await expectOk(await schemaApi.getByWorkspace(WORKSPACE_CODE));
+
+      // 5. Push live first, THEN activate the resulting LIVE record (using its own id) —
+      // updateState only operates on the LIVE edition; see connection.api.spec.ts's note for
+      // the live-captured evidence (error code 1072, "not found in LIVE DB").
+      const pushLiveRes = await schemaApi.pushLive(code);
+      const live = await expectOk(pushLiveRes);
+      cleanup.push(() => schemaApi.deleteLive(code));
+
+      await expectOk(await schemaApi.updateState(live.id, 'ACTIVE'));
+      await expectOk(await schemaApi.getByCodeAndState(code, 'ACTIVE'));
+
+      // 6. Version-bump check — capture only, don't assert an exact value yet. `version` IS a
+      // confirmed real field (see this file's doc comment) but the bump MECHANICS are not, so
+      // nothing about the relationship between these two values is asserted.
+      // CHANGED (2026-09-02): was a `console.log`, which is invisible in the HTML report and
+      // lost from CI logs — the evidence needed to tighten this was being discarded every run.
+      // It is now attached to the report, where the next person will actually look for it.
+      await test.info().attach('capture-me: Schema version before/after push-live', {
+        body: Buffer.from(
+          JSON.stringify({ versionBeforePushLive, versionAfterPushLive: live?.version }, null, 2)
+        ),
+        contentType: 'application/json',
+      });
+      // TODO once confirmed: expect(live.version).not.toBe(versionBeforePushLive);
+
+      // 7. Exploratory: restoreLive/changeWorkspace aren't exercised for Schema in the
+      // reference — capture what actually happens rather than asserting a fixed status.
+      //
+      // CHANGED (2026-09-02): this step used to have ZERO assertions — just a `console.log` of
+      // the status — so it could never fail and never recorded anything usable. The real
+      // status+body are now ATTACHED to the report.
+      // CAPTURE TODO: nothing about restoreLive's expected outcome for Schema has been
+      // captured. This file's own comments explicitly say the reference does NOT exercise
+      // restoreLive for Schema and to treat it as exploratory, so asserting 200 (or any other
+      // status) here would be an invented expectation. The assertion below deliberately proves
+      // only that a response came back at all. Once the attachment from a live run shows the
+      // real status, replace it with `await expectStatus(restoreRes, <captured status>)`.
+      const restoreRes = await schemaApi.restoreLive(code);
+      await test.info().attach(`capture-me: Schema restoreLive (${restoreRes.status()})`, {
+        body: Buffer.from(
+          JSON.stringify({ status: restoreRes.status(), body: await safeJson(restoreRes) }, null, 2)
+        ),
+        contentType: 'application/json',
+      });
+      expect(restoreRes.status(), 'restoreLive did not return an HTTP response at all').toBeGreaterThanOrEqual(100);
+    } finally {
+      await cleanup.runAll();
+    }
+  });
+
+  // --- Negatives (capture-first) ---
+  //
+  // Evidence ported verbatim from magpie's SchemaCrudTests.java (read directly from the
+  // reference source; method names cited per assertion).
+  //
+  // NOTE for the team: while extracting this evidence, a copy-paste bug was found in the
+  // reference's own crt_scm.csv/upd_scm.csv — the "without code" row and the "without workspace
+  // code" row carry byte-identical payloads/expected-violations (both actually omit only
+  // workspaceCode). "without code" never actually tests a missing-code payload in isolation —
+  // only the combined "without any fields" empty-object row exercises that violation. Worth
+  // flagging upstream; not something to "fix" on our side.
+
+  // Dimension 1: missing required fields (code / type).
+  // createDraftSchemaNegativeTest (crt_scm.csv), row "without any fields" (payload `{}`).
+  test('API-SCHM-002 — rejects a schema missing required fields (code / type)', async ({ schemaApi }) => {
+    const res = await schemaApi.create({});
+    await expectValidationError(res, {
+      violations: [
+        { fieldName: 'code', errorMessage: 'Schema code is missing' },
+        { fieldName: 'type', errorMessage: 'Type is null or not supported, supported types: [EVENT, NOTIFICATION, ACTION]' },
+      ],
+    });
+  });
+
+  // Dimension 2: invalid type / fields[].type enum value — both Jackson enum-parse shapes
+  // (code 1010, no violations array), using distinct enum classes for the top-level type vs a
+  // field's type.
+  // createDraftSchemaNegativeTest, CSV rows "with invalid type" / "with invalid field type".
+  test('API-SCHM-003 — rejects an invalid type/fields[].type enum value', async ({ schemaApi }) => {
+    const code = `qa_schema_bad_type_${Date.now()}`;
+    const res = await schemaApi.create(
+      buildEventSchemaPayload(code, WORKSPACE_CODE, [{ name: 'id', type: 'STRING', required: true, description: 'id' }], {
+        type: 'OTHER',
+      })
+    );
+    const body = await expectErrorBody(res, {
+      status: 400,
+      code: 1010,
+      message:
+        'JSON parse error: Cannot deserialize value of type `com.seera.core.ems.constants.SchemaTypeE` from String "OTHER": not one of the values accepted for Enum class: [EVENT, NOTIFICATION, ACTION]',
+    });
+    // The absence of `violations` is itself part of the captured 1010 shape — see this test's
+    // comment above — so it stays asserted explicitly; expectErrorBody doesn't cover it.
+    expect(body.violations).toBeFalsy();
+
+    const code2 = `qa_schema_bad_field_type_${Date.now()}`;
+    const res2 = await schemaApi.create(
+      buildEventSchemaPayload(code2, WORKSPACE_CODE, [{ name: 'id', type: 'OTHER', required: true, description: 'id' }])
+    );
+    const body2 = await expectErrorBody(res2, {
+      status: 400,
+      code: 1010,
+      message:
+        'JSON parse error: Cannot deserialize value of type `com.seera.core.ems.constants.SchemaInfoFieldTypeE` from String "OTHER": not one of the values accepted for Enum class: [BOOLEAN, STRING, INTEGER, DOUBLE]',
+    });
+    expect(body2.violations).toBeFalsy();
+  });
+
+  // Dimension 3: duplicate code on create.
+  // createDraftSchemaWithExistingCodeNegativeTest — message is grammatically off in the
+  // reference itself ("is already exist"); ported verbatim, not "fixed".
+  test('API-SCHM-004 — rejects a duplicate schema code', async ({ schemaApi }) => {
+    const code = `qa_schema_dup_${Date.now()}`;
+    const payload = buildEventSchemaPayload(code, WORKSPACE_CODE, [{ name: 'id', type: 'STRING', required: true, description: 'id' }]);
+    // Setup guard (added 2026-09-02): this create used to go straight to `.json()` with no
+    // status check, so a failed setup surfaced as a confusing mismatch in the assertion below
+    // instead of a clear "setup failed" signal — the same guard flow.api.spec.ts already uses.
+    const created = await expectOk(await schemaApi.create(payload));
+    try {
+      const dup = await schemaApi.create(payload);
+      await expectValidationError(dup, {
+        violations: [{ fieldName: 'code', errorMessage: `Schema with code ${code} is already exist` }],
+      });
+    } finally {
+      await schemaApi.delete(created.id);
+    }
+  });
+
+  // Dimension 4: immutable code on update. Flagged in domain notes as historically buggy for
+  // Schema specifically — confirmed here: the "code cannot be changed" violation actually fires
+  // on OTHER failure paths too (updating a LIVE edition, or an invalid id), not just on a genuine
+  // code change. This test uses the one "clean" case (updateDraftSchemaWithDifferentCodeNegativeTest)
+  // where the code really is different.
+  test('API-SCHM-005 — rejects changing a schema\'s code on update', async ({ schemaApi }) => {
+    const code = `qa_schema_upd_code_${Date.now()}`;
+    // Setup guard — see the duplicate-code test above.
+    const created = await expectOk(
+      await schemaApi.create(buildEventSchemaPayload(code, WORKSPACE_CODE, [{ name: 'id', type: 'STRING', required: true, description: 'id' }]))
+    );
+    try {
+      const res = await schemaApi.update(created.id, { ...created, code: `${code}_changed` });
+      await expectValidationError(res, {
+        violations: [{ fieldName: 'code', errorMessage: 'Code cannot be changed' }],
+      });
+    } finally {
+      await schemaApi.delete(created.id);
+    }
+  });
+
+  // Dimension 5/6: not-found by id / by code — Schema is one of only two entities in this suite
+  // (the other is Observer) confirmed to get a real HTTP 404, same body for both lookup paths.
+  // fetchSchemaByInvalidIdNegativeTest / pushSchemaToLiveByInvalidNegativeTest.
+  test('API-SCHM-006 — 404s on an unknown schema id/code', async ({ schemaApi }) => {
+    const byId = await schemaApi.getById(INVALID_OBJECT_ID);
+    const byIdBody = await expectErrorBody(byId, { status: 404, code: 1032, message: 'Schema not found in DB' });
+    expect(byIdBody.status).toBe('NOT_FOUND');
+  });
+
+  // Dimension 8: edition guard — deleting a draft with a live twin.
+  // deleteDraftSchemaWithExistingLiveVersionNegativeTest — message is ungrammatical in the
+  // reference itself; ported verbatim.
+  test('API-SCHM-007 — blocks deleting a draft schema that has a live edition', async ({ schemaApi }) => {
+    const code = `qa_schema_del_live_${Date.now()}`;
+    // Setup guard — see the duplicate-code test above.
+    const created = await expectOk(
+      await schemaApi.create(buildEventSchemaPayload(code, WORKSPACE_CODE, [{ name: 'id', type: 'STRING', required: true, description: 'id' }]))
+    );
+    const pushLiveRes = await schemaApi.pushLive(code);
+    await expectOk(pushLiveRes);
+    try {
+      const res = await schemaApi.delete(created.id);
+      await expectValidationError(res, {
+        violations: [
+          { fieldName: 'hasAnotherEdition', errorMessage: 'Has live edition, please delete live schema before.' },
+        ],
+      });
+    } finally {
+      await schemaApi.deleteLive(code);
+      await schemaApi.delete(created.id);
+    }
+  });
+
+  // Dimension 10: missing/insufficient auth — NO EVIDENCE FOUND. No test in SchemaCrudTests.java
+  // asserts a 401/403/permission-denied rejection.
+  test.skip('@pending API-SCHM-008 — rejects requests without the required permission/workspace', async () => {});
+
+  // Cross-entity check from the scenario catalog: push a real event whose payload is
+  // missing a `required: true` field and confirm the gateway rejects it — belongs here
+  // once eventIngestionApi + a live schema are both available in the same test.
+  test.skip('@pending API-SCHM-009 — rejects a pushed event missing a schema-required field', async () => {});
+});

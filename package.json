@@ -1,0 +1,39 @@
+{
+  "name": "ems-ui-automation",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Playwright + TypeScript UI automation for the EMS dashboard (dev/staging/prod) — local pilot to evaluate replacing the existing Cypress suite.",
+  "scripts": {
+    "test": "playwright test",
+    "test:smoke": "playwright test --grep @smoke",
+    "test:regression": "playwright test --grep @regression",
+    "test:api": "playwright test --project=Backend",
+    "test:ui": "playwright test --project=Frontend",
+    "test:e2e": "playwright test --project=\"E2E Journeys\"",
+    "test:pending": "cross-env RUN_PENDING=1 playwright test --grep @pending --list",
+    "test:dev": "cross-env ENV=dev playwright test",
+    "test:staging": "cross-env ENV=staging playwright test",
+    "test:prod": "cross-env ENV=prod playwright test --grep @smoke",
+    "demo": "npm run clean:results && playwright test; npm run report:summary && npm run report:allure:generate && npm run report:where",
+    "clean:results": "node scripts/clean-results.js",
+    "report": "playwright show-report",
+    "report:summary": "node scripts/generate-summary.js",
+    "report:allure:prepare": "node scripts/allure-prepare.js",
+    "report:allure:generate": "npm run report:allure:prepare && allure generate allure-results --clean -o allure-report",
+    "report:allure": "npm run report:allure:generate && allure open allure-report",
+    "codegen": "playwright codegen",
+    "report:where": "node scripts/report-where.js"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.48.0",
+    "@types/node": "^22.0.0",
+    "allure-commandline": "^2.43.0",
+    "allure-playwright": "^3.11.1",
+    "cross-env": "^7.0.3",
+    "dotenv": "^16.4.0",
+    "typescript": "^5.6.0"
+  },
+  "dependencies": {
+    "playwright": "^1.62.1"
+  }
+}
