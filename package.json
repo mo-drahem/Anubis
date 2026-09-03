@@ -1,8 +1,8 @@
 {
-  "name": "ems-ui-automation",
+  "name": "anubis",
   "version": "0.1.0",
   "private": true,
-  "description": "Playwright + TypeScript UI automation for the EMS dashboard (dev/staging/prod) — local pilot to evaluate replacing the existing Cypress suite.",
+  "description": "Anubis — Playwright + TypeScript test automation for the EMS platform. API services, UI screens and cross-module end-to-end journeys in one framework.",
   "scripts": {
     "test": "playwright test",
     "test:smoke": "playwright test --grep @smoke",

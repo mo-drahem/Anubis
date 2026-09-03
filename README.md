@@ -1,144 +1,240 @@
-# EMS Automation (Playwright + TypeScript)
+# Anubis
 
-Local pilot project automating EMS across dev, staging, and production. Being built as a
-standalone proof of concept, not yet wired into Jenkins, so it can be evaluated side-by-side
-against the existing Cypress suite before deciding whether to replace it.
+_EMS test automation framework._
 
-EMS itself is an event-driven orchestration platform (configuration, triggers, flow
-orchestration, gateway ingress, execution tracking, and reporting), not a simple event-listing
-dashboard — see `EMS_API_Domain_Notes.md` for the full business/domain writeup this framework is
-built against, distilled from the existing "magpie" QA backend framework (Postman collection +
-Java/RestAssured suite + `.agents/skills` rules pack).
+**Playwright + TypeScript** automation for the EMS (Event Management System) platform — covering API services, UI screens, and end-to-end user journeys across dev, staging, and production.
 
-**Current phase:** API coverage is actively built out with 13 resource spec files (including Reporting
-and Input Core). UI page objects exist for Events, Flows, and — newly added — Connection, Api Call,
-Mapper, Script, Global Variable, Observer, and Vault list/form screens under `pages/ems/`. Hybrid
-regression scenarios (`tests/regression/`) exercise cross-module flows; several E2E scenarios still
-depend on selectors that need live capture against ems-dev.
+> **Status:** Active pilot project. Built as a standalone proof of concept to evaluate replacing the existing Cypress suite. Not yet integrated into Jenkins CI.
 
-## Setup
+---
+
+## Executive Summary
+
+EMS is an event-driven orchestration platform — configuration, triggers, flow orchestration, gateway ingress, execution tracking, and reporting. This framework automates validation of that platform at three levels:
+
+| Tier | What it tests | Speed | Command |
+|------|---------------|-------|---------|
+| **Backend** | EMS microservice APIs (CRUD, lifecycle, permissions) | ~1 min | `npm run test:api` |
+| **Frontend** | Individual UI screens (auth, navigation, events, flows) | ~5 min | `npm run test:ui` |
+| **E2E Journeys** | Cross-module workflows (Connection → Api Call → Mapper → Event) | ~15 min | `npm run test:e2e` |
+
+**Current coverage:** 13 API resource suites, 4 UI spec files, and 10 end-to-end journey scenarios — with page objects for all major EMS entity screens.
+
+---
+
+## Why This Project
+
+| Goal | Detail |
+|------|--------|
+| **Modernise the test stack** | Evaluate Playwright + TypeScript as a successor to the existing Cypress suite |
+| **Broader coverage** | API-first design lets tests seed data in seconds instead of clicking through multi-step UI flows |
+| **Management-ready reporting** | Executive summary, Allure reports, and environment provenance built in |
+| **Low-risk evaluation** | Runs locally alongside the current suite — no CI disruption until the pilot is approved |
+
+Domain knowledge is grounded in the existing QA backend framework (Postman collection, Java/RestAssured suite). See [`EMS_API_Domain_Notes.md`](EMS_API_Domain_Notes.md) for the full business and service map.
+
+---
+
+## Coverage Overview
+
+### API (Backend)
+
+One spec file per EMS resource — full lifecycle paths (create → read → update → publish → activate → delete) plus permission-boundary cases.
+
+| Resource | Spec file | Status |
+|----------|-----------|--------|
+| Connection | `connection.api.spec.ts` | Active |
+| Api Call | `apiCall.api.spec.ts` | Active |
+| Mapper | `mapper.api.spec.ts` | Active |
+| Flow | `flow.api.spec.ts` | Active |
+| Schema | `schema.api.spec.ts` | Active |
+| Observer | `observer.api.spec.ts` | Partial — blocked on backend config |
+| Script | `script.api.spec.ts` | Active |
+| Secret / Vault | `secret.api.spec.ts` | Active |
+| Global Variables | `globalVariables.api.spec.ts` | Active |
+| Workspace | `workspace.api.spec.ts` | Active |
+| Track | `track.api.spec.ts` | Active |
+| Reporting | `reporting.api.spec.ts` | Active |
+| Input Core | `inputCore.api.spec.ts` | Active |
+
+### UI (Frontend)
+
+Single-screen tests — each verifies one entity or one screen in isolation.
+
+| Area | Spec file | Scenarios |
+|------|-----------|-----------|
+| Authentication | `auth.ui.spec.ts` | Login, session, logout |
+| Navigation | `navigation.ui.spec.ts` | Sidebar, workspace switcher |
+| Events | `events.ui.spec.ts` | Full Draft → Publish → Live → Activate lifecycle |
+| Flow list | `flow-list.ui.spec.ts` | List, search, API-seeded data |
+
+Page objects exist for Connection, Api Call, Mapper, Script, Global Variable, Observer, and Vault screens under `pages/ems/`.
+
+### E2E Journeys (Regression)
+
+Cross-module scenarios that walk several EMS modules in a single test.
+
+| ID | Scenario | Status |
+|----|----------|--------|
+| E2E-01 | Build a pipeline: Connection + Api Call + Mapper → Event | Active |
+| E2E-02 | Publish an API call while its connection is still draft | Active |
+| E2E-03 | Delete a full pipeline in the correct order | Active |
+| E2E-04 | Create a connection using a Vault secret | Active |
+| E2E-05 | Create flow with API Call and Delay nodes | Pending — selectors needed |
+| E2E-06 | Create API call referencing a Global Variable | Pending — token syntax unconfirmed |
+| E2E-07 | Create flow with Script node, then delete live script | Active |
+| E2E-08 | Cross-workspace event visibility | Active |
+| E2E-10 | Event with searchable fields, then edit schema | Active |
+| E2E-11 | Observer on broker connection | Pending — backend issue |
+| E2E-12 | Push event and verify in reporting | Active |
+
+Scenarios tagged `@pending` are documented blockers — they stay in the repo but are excluded from default runs so a green result means green.
+
+---
+
+## Reporting
+
+The framework produces reports for both engineers and reviewers.
+
+```bash
+npm run demo          # Full run + executive summary + Allure report
+npm run report        # Open Playwright HTML report (traces, screenshots, video)
+npm run report:summary   # One-page executive summary (pass rate, module coverage)
+npm run report:allure    # Industry-standard Allure report with environment context
+```
+
+**What reviewers see in Allure:**
+
+- Environment provenance (target env, workspace, browser, viewport)
+- Failure categorisation (environment issue vs selector drift vs product defect)
+- Per-tier suite breakdown (Backend / Frontend / E2E Journeys)
+
+---
+
+## Architecture
+
+```
+tests/
+├── api/           → Backend tier   (no browser, direct microservice calls)
+├── ui/            → Frontend tier  (single-screen UI, Chrome 1920×1080)
+└── regression/    → E2E Journeys   (cross-module flows, 3× time budget)
+
+api/               → API clients organised by EMS business domain
+pages/ems/         → Page objects for dashboard screens
+fixtures/          → Shared test setup (auth, API seeding, hybrid UI+API)
+utils/             → Test data, cleanup, environment helpers
+```
+
+**Hybrid pattern:** E2E scenarios seed data via API (fast, reliable) and verify through the UI (what the user actually sees). This keeps a 12-step journey to minutes instead of tens of minutes.
+
+---
+
+## Getting Started
+
+### Prerequisites
+
+- Node.js 18+
+- Google Chrome (installed locally — tests use the Chrome channel, not bundled Chromium)
+- VPN or office network access to `*.tajawal-<env>.internal` hosts
+
+### Setup
 
 ```bash
 npm install
-npx playwright install   # downloads the Chromium/Firefox/WebKit browsers
+npx playwright install chrome
 ```
 
-Fill in `.env.dev` / `.env.staging` / `.env.prod` from `.env.example` — these are gitignored,
-never commit real values. Most API calls don't need a real login at all; they use a
-caller-supplied internal identity instead (see "Auth" below).
+Copy `.env.example` to `.env.dev` (and `.env.staging` / `.env.prod` as needed) and fill in real values. These files are gitignored — never commit credentials.
 
-**Network note:** almost every EMS service URL is internal (`*.tajawal-<env>.internal`) and only
-resolves over the office network/VPN — tests must run from a machine that can reach it (they'll
-fail with a DNS/connect error, not a test failure, otherwise).
-
-## Running tests
+### Run tests
 
 ```bash
-npm run test:api            # pure API suite, single run, no browsers
-npm run test:smoke          # @smoke UI tests against dev (default ENV)
-npm run test:regression     # hybrid UI+API scenarios
-npm run report              # open the last HTML report (traces, screenshots, video)
+npm run test:api            # API suite only (~1 min)
+npm run test:ui             # UI screens only
+npm run test:e2e            # End-to-end journeys only
+npm run test:smoke          # @smoke-tagged tests
+npm run test:dev            # All tiers against dev (default)
+npm run test:staging        # All tiers against staging
+npm run test:prod           # Smoke only against production
+npm run test:pending        # List @pending backlog (excluded from default runs)
 ```
 
-## API layer
+### Demo for stakeholders
 
-`api/` is organized by EMS business domain (see `EMS_API_Domain_Notes.md`'s "Service map"), not
-by raw HTTP host:
+```bash
+npm run demo
+```
 
-- `api/config.ts` — resolves every microservice base URL, the workspace code, and the DRAFT/LIVE
-  edition from `.env.<ENV>` (lazily, so a test that never touches a given service doesn't need
-  its URL filled in).
-- `api/BaseApiClient.ts` — thin Playwright `APIRequestContext` wrapper; headers are baked in at
-  construction (not per-call), and `get/post/put/patch/delete` deliberately return the raw,
-  unparsed `APIResponse` — tests assert on exactly what came back, not a pre-digested version.
-- `api/AuthApi.ts` — both auth paths: `login()` (real `POST /auth/login`, for the public UI
-  Gateway) and `getRealUserInfoHeader()` (fetches `/auth/user_info` for a real token).
-- `api/ems/permissions.ts` + `api/ems/internalIdentity.ts` — the internal trust mechanism nearly
-  every direct microservice call actually uses: `internalHeaders(permissions, workspaceCode?)`
-  builds the base64 `x-user-info` + `x-workspace` headers from a fabricated identity, no real
-  login required. This only works on the internal network — never use it against a
-  public-facing endpoint or production.
-- `api/resources/DraftLiveResourceApi.ts` — one generic class for the recurring DRAFT/LIVE CRUD
-  + lifecycle shape shared by ~10 config entities (list/create/update/delete/getById/getByCode/
-  getLiveByCode/getDraftByCode/getByCodeAndState/pushLive/restoreLive/deleteLive/getByWorkspace/
-  changeWorkspace/updateState), parametrized by `resourcePath` — see `fixtures/api.fixture.ts` for
-  how each entity (flow, schema, observer, connection, api-call, mapper, secret, script,
-  global-variables) is wired up on top of it.
-- `api/resources/WorkspaceApi.ts` — Workspace + ws-usr (workspace-user link) endpoints, which
-  don't follow the draft/live pattern.
-- `api/resources/EventIngestionApi.ts` — pushes events via the API Gateway (`POST /push`) and
-  reads back track info for a pushed job.
-- `api/resources/TrackApi.ts` — execution-tracking CRUD/history/data lookups.
-- `api/resources/ReportingApi.ts` / `api/resources/InputCoreApi.ts` — added in this pass; both
-  confirmed to exist against the magpie reference's client interfaces, but **not yet
-  capture-verified against a live response** (see the TODO comment in each file) — hit them
-  against dev and tighten the types/assertions before relying on them in a real test.
-- `fixtures/api.fixture.ts` — the bundled per-resource Playwright fixtures (`flowApi`, `schemaApi`,
-  `workspaceApi`, `reportingApi`, ...) plus `buildInternalClient(baseUrl, permissions,
-  workspaceCode?)` for one-off permission-boundary tests.
-- `fixtures/hybrid.fixture.ts` — merges the API fixtures above with `auth.fixture.ts`'s UI
-  fixtures into one `test`, for scenarios that seed/tear down via API but verify through the UI
-  (e.g. `seededFlow`, `seededEvent`).
-- `utils/cleanup.ts` — `CleanupStack`, a LIFO best-effort teardown helper for scenarios that seed
-  more than one interdependent resource.
-- `tests/api/*.spec.ts` — one spec file per resource (see `tests/api/README.md` for the naming
-  convention). **Capture-first discipline:** hit the endpoint against dev, read the real
-  `ErrorResponse`, and assert exactly that — never guess a code or message string. No scenarios
-  are checked in yet; add them here as they're written.
+Runs the full suite, generates the executive summary and Allure report, and prints paths to all artifacts.
 
-## UI layer (in progress)
+---
 
-- `pages/ems/` — page objects for the dashboard: Events, Flows (list + form + `FlowDetailsModal`),
-  Connection/Api Call/Mapper/Script/Global Variable/Observer list+form pages (presumed `{Entity}Form_*`
-  testids — confirm via `npx playwright codegen`), Vault list, shared `EntityListPage` /
-  `GenericEntityDetailPage`, `SidebarNav`, `EntityHeaderActions`, `emsRoutes`.
-- `pages/LoginPage.ts` — real login page object. `pages/BasePage.ts` and `pages/DashboardPage.ts`
-  are earlier placeholders; `DashboardPage.ts` in particular is deprecated (there's no single
-  "dashboard" screen to model — see the note in `auth.fixture.ts`).
-- `components/NavBar.ts` — placeholder, not yet reconciled with `pages/ems/SidebarNav.ts`.
-- `fixtures/auth.fixture.ts` — `authenticatedPage` (logs in once via `LoginPage`), `sidebarNav`.
-- `tests/ui/`, `tests/regression/` — UI smoke/regression specs exist; see their READMEs for scope.
+## Roadmap
 
-## Exploring the real app
+### Near term
+
+- [ ] Complete negative-case coverage in API specs (capture-first: assert on real error responses from dev, never guess)
+- [ ] Resolve Observer backend/config blockers (E2E-11, API-OBS-*)
+- [ ] Capture remaining UI selectors for Flow Details modal and Global Variable references (E2E-05, E2E-06)
+- [ ] Map scenarios from the existing Cypress suite to reach parity before presenting as a replacement
+
+### Before production use
+
+- [ ] Confirm production EMS service URLs in `.env.prod`
+- [ ] Validate Reporting and Input Core response shapes against live dev responses
+- [ ] Decide on CI integration (Jenkins), scheduled staging runs, and Allure publishing
+
+---
+
+## Documentation
+
+| Document | Audience | Contents |
+|----------|----------|----------|
+| [`EMS_API_Domain_Notes.md`](EMS_API_Domain_Notes.md) | Engineers + QA | EMS business domain, service map, API patterns |
+| [`tests/api/README.md`](tests/api/README.md) | Engineers | API tier conventions and fixture usage |
+| [`tests/ui/README.md`](tests/ui/README.md) | Engineers | UI tier conventions and page object guide |
+| [`tests/regression/README.md`](tests/regression/README.md) | Engineers | E2E journey conventions and hybrid fixture pattern |
+| [`.env.example`](.env.example) | Engineers | Required environment variables per target env |
+
+---
+
+## Technical Reference
+
+<details>
+<summary><strong>API layer structure</strong> (for engineers)</summary>
+
+- `api/config.ts` — resolves microservice URLs, workspace code, and DRAFT/LIVE edition from `.env.<ENV>`
+- `api/BaseApiClient.ts` — Playwright `APIRequestContext` wrapper; returns raw responses for precise assertions
+- `api/AuthApi.ts` — real login (`POST /auth/login`) and user-info header for UI Gateway
+- `api/ems/internalIdentity.ts` — internal trust headers (`x-user-info`) for direct microservice calls (internal network only)
+- `api/resources/DraftLiveResourceApi.ts` — generic CRUD + lifecycle for ~10 config entities (flow, schema, observer, connection, etc.)
+- `fixtures/api.fixture.ts` — per-resource Playwright fixtures (`flowApi`, `schemaApi`, `connectionApi`, …)
+- `fixtures/hybrid.fixture.ts` — merges API + UI fixtures for cross-tier scenarios
+
+</details>
+
+<details>
+<summary><strong>UI layer structure</strong> (for engineers)</summary>
+
+- `pages/ems/` — page objects for all major entity screens (list, form, detail, sidebar nav)
+- `fixtures/auth.fixture.ts` — `authenticatedPage` (logs in once, switches to QA workspace)
+- `components/NavBar.ts` — legacy placeholder; use `pages/ems/SidebarNav.ts` instead
+
+Record real locators against the live app:
 
 ```bash
 npx playwright codegen https://ems-dev.almosafer.com
 ```
 
-Use this to record real locators against the live dashboard rather than guessing; confirm/replace
-any remaining placeholder locator before relying on it.
+</details>
 
-## Housekeeping
+<details>
+<summary><strong>Auth model</strong> (for engineers)</summary>
 
-`_to_delete/` holds files superseded during a merge of two parallel builds of this project (an
-earlier duplicate `api/core/` + `api/domains/` + `api/fixtures/` structure, some now-redundant
-example specs, and older zip/staging artifacts) — nothing in active use references them. Safe to
-delete that folder once you've confirmed nothing in it is needed.
+Most API tests use **internal identity headers** — a fabricated `x-user-info` + `x-workspace` pair that EMS microservices trust on the internal network. No real login required.
 
-## Status / open items
+UI tests use **real credentials** via `TEST_USER_EMAIL` / `TEST_USER_PASSWORD` in `.env.<ENV>`.
 
-**API:**
+Internal identity must never be used against public-facing endpoints or production.
 
-- [ ] Fill in the negative `test.skip` TODOs in `tests/api/*.spec.ts` by running each positive
-      test against dev, then capturing the real `ErrorResponse` for the negative case (see
-      "capture-first" in `EMS_API_Domain_Notes.md`) — do not hand-write expected codes/messages.
-- [ ] Capture real responses for `ReportingApi` and `InputCoreApi` against dev and tighten their
-      request/response types accordingly.
-- [ ] Confirm a real `WORKSPACE_CODE` (and any other QA fixture codes) in `.env.dev` /
-      `.env.staging` so tests stop depending on empty placeholders.
-- [ ] Confirm production EMS service URLs (all placeholders in `.env.prod` today — the existing
-      framework doesn't have them either) before any prod automation is written.
-- [ ] Expand domain coverage — Observer, Flow (node-level scenarios), Connection/Broker, Mapper,
-      Script, Global Variables — following the same `test.skip` + capture-first pattern.
-- [ ] Map scenarios already covered by the existing Cypress suite so this project reaches parity
-      before it's presented as a replacement candidate.
-- [ ] Once mature: decide on CI integration (Jenkins), Allure reporting, and running against
-      staging.
-
-**UI:**
-
-- [ ] Reconcile `components/NavBar.ts` with `pages/ems/SidebarNav.ts` (likely redundant).
-- [ ] Port remaining screens (Mapper, Connection, API Call, Script, Global Variable, Vault) to
-      `pages/ems/` before writing specs that need them.
-- [ ] Write the first `tests/ui/*.spec.ts` / `tests/regression/*.spec.ts` scenarios once specific
-      screens/flows are shared.
+</details>
